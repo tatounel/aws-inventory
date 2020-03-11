@@ -1,7 +1,7 @@
 """Abstraction for invoking AWS APIs (a.k.a. operations) and handling responses."""
 
 import logging
-from Queue import Queue
+from queue import Queue
 from threading import Thread
 
 import botocore
@@ -11,18 +11,24 @@ import config
 import progress
 import store
 
+from tqdm import *
 
 LOGGER = logging.getLogger(__name__)
 
 class ApiInvoker(object):
     """Invoke APIs from GUI."""
 
-    def __init__(self, script_args, svc_descriptors, ops_count):
+    def __init__(self, script_args, svc_descriptors, ops_count, gui_data_file, response_data_file, exception_data_file):
         self.script_args = script_args
         self.svc_descriptors = svc_descriptors
         self.ops_count = ops_count
-        self.progress_bar = None
-        self.store = store.ResultStore(script_args.profile)
+        self.progress = tqdm(total=ops_count)
+
+        self.gui_data_file = gui_data_file
+        self.response_data_file = response_data_file
+        self.exception_data_file = exception_data_file
+
+        # self.store = store.ResultStore(self.script_args.profile)
 
         # search for AWS credentials
         # using opinel allows us to use MFA and a CSV file. Otherwise, we could just use
@@ -35,14 +41,6 @@ class ApiInvoker(object):
         if not self.credentials['AccessKeyId']:
             raise EnvironmentError('Failed to get AWS account credentials.')
         LOGGER.info('Using AWS credential key ID: %s.', self.credentials['AccessKeyId'])
-
-    def start(self):
-        """Start the invoker with associated GUI. Wait for GUI to stop."""
-        self.progress_bar = progress.GuiProgressBar(
-            'AWS Inventory',
-            self.ops_count,
-            self._probe_services)
-        self.progress_bar.mainloop()
 
     def _probe_services(self):
         try:
@@ -61,9 +59,11 @@ class ApiInvoker(object):
                 api_version = session.get_config_variable('api_versions').get(svc_name, None)
                 params = {'svc_name': svc_name,
                           'dry_run': self.script_args.dry_run,
-                          'store': self.store}
+                          'store': self.store,
+                          'progress' : self.progress }
                 for region in regions:
-                    self.progress_bar.update_svc_text(svc_name, region)
+                    self.progress.set_description(self.script_args.profile + "/" + str(svc_name) + "/" + str(region))
+                    #self.progress_bar.update_svc_text(svc_name, region)
                     try:
                         client = session.create_client(
                             svc_name,
@@ -75,7 +75,7 @@ class ApiInvoker(object):
                             config=client_config
                         )
                     except botocore.exceptions.NoRegionError:
-                        LOGGER.warning('[%s][%s] Issue in region detection. Using default region.',
+                        self.progress.write('[%s][%s] Issue in region detection. Using default region.',
                                        config.DEFAULT_REGION,
                                        svc_name)
                         client = session.create_client(
@@ -94,13 +94,12 @@ class ApiInvoker(object):
                         operations,
                         self.svc_worker,
                         params)
-                    self.progress_bar.update_progress(len(operations))
-            self.progress_bar.finish_work()
+                    self.progress.update(len(operations))
             self.write_results()
         except progress.LifetimeError as e:
             LOGGER.debug(e)
 
-    def write_results(self, response_dump_fp=None, exception_dump_fp=None, gui_data_fp=None):
+    def write_results(self):
         """Output the results, if not a dry run.
 
         :param file response_dump_fp: file for responses
@@ -108,25 +107,19 @@ class ApiInvoker(object):
         :param file gui_data_fp: file for GUI data
         """
         if not self.script_args.dry_run:
-            if response_dump_fp:
-                self.store.dump_response_store(response_dump_fp)
-            elif self.script_args.responses_dump:
-                with open(self.script_args.responses_dump, 'wb') as out_fp:
+            if self.response_data_file is not None:
+                with open(self.response_data_file, 'w') as out_fp:
                     self.store.dump_response_store(out_fp)
 
-            if exception_dump_fp:
-                self.store.dump_exception_store(exception_dump_fp)
-            elif self.script_args.exceptions_dump:
-                with open(self.script_args.exceptions_dump, 'wb') as out_fp:
+            if self.exception_data_file is not None:
+                with open(self.script_args.exception_data_file, 'wb') as out_fp:
                     self.store.dump_exception_store(out_fp)
 
             if self.script_args.verbose:
-                print self.store.get_response_store()
+                print(self.store.get_response_store())
 
-            if gui_data_fp:
-                self.store.generate_data_file(gui_data_fp)
-            else:
-                with open(self.script_args.gui_data_file, 'w') as out_fp:
+            if self.gui_data_file is not None:
+                with open(self.gui_data_file, 'w') as out_fp:
                     self.store.generate_data_file(out_fp)
 
     @staticmethod
@@ -149,11 +142,7 @@ class ApiInvoker(object):
 
                 # this is the way botocore does it. See botocore/__init__.py
                 py_op = botocore.xform_name(svc_op)
-                LOGGER.debug('[%s][%s] Invoking API "%s". Python name "%s".',
-                             region,
-                             svc_name,
-                             svc_op,
-                             py_op)
+                params['progress'].write('DEBUG [{0}][{1}] Invoking API "{2}". Python name "{3}".'.format(region,svc_name,svc_op,py_op))
 
                 if not params['dry_run']:
                     if params['client'].can_paginate(py_op):
@@ -164,17 +153,14 @@ class ApiInvoker(object):
                     storage.add_response(svc_name, region, svc_op, response)
             except Exception as e:
                 storage.add_exception(svc_name, region, svc_op, e)
-                LOGGER.exception(
-                    'Unknown error while invoking API for service "%s" in region "%s".',
-                    svc_name,
-                    region)
+                params['progress'].write('EXCEPTION Unknown error while invoking API for service "{0}" in region "{1}".'.format(svc_name,region))
             finally:
                 que.task_done()
 
 #XXX: borrowed from opinel because their threading module is failing to load. Pretty much the example in the Queue docs
 def thread_work(targets, function, params=None):
     """Thread worker creator.
-
+    
     :param list targets: changing parameters
     :param function function: callback function
     :param dict params: static parameters
