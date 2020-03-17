@@ -11,8 +11,8 @@ import uuid
 
 import botocore
 
-import config
-import version
+from . import config
+from . import version
 
 
 LOGGER = logging.getLogger(__name__)
@@ -39,7 +39,7 @@ class ResultStore(object):
     def add_response(self, service, region, svc_op, resp):
         """Add a response to the store for a given service for an operation in a region. Replace
         existing values.
-
+        
         :param str service: service name
         :param str region: region name
         :param str svc_op: service operation name
@@ -80,7 +80,14 @@ class ResultStore(object):
         :return: serialized response store in JSON format
         """
         LOGGER.debug('Building the response store.')
-        return json.dumps(self._response_store, cls=ResponseEncoder)
+        return json.dumps({ 
+            'run_date': self.run_date,
+            'commandline': self.commandline,
+            'version': self.version,
+            'botocore_version': botocore.__version__,
+            'profile' : self.profile, 
+            'responses' : self._response_store 
+            }, cls=ResponseEncoder)
 
     def dump_response_store(self, fp):
         """Pickle the response store.
@@ -88,7 +95,8 @@ class ResultStore(object):
         :param file fp: file to write to
         """
         LOGGER.debug('Writing the response store to file "%s".', fp.name)
-        pickle.dump(self._response_store, fp)
+        fp.write(self.get_response_store())
+        #pickle.dump(self._response_store, fp)
 
     def dump_exception_store(self, fp):
         """Pickle the exception store.
@@ -116,17 +124,17 @@ class ResultStore(object):
         def build_children(obj):
             children = []
             if isinstance(obj, dict):
-                for key, val in obj.items():
+                for key, val in list(obj.items()):
                     child = build_children(val)
                     if isinstance(child, (dict, list, tuple)) and child:
                         children.append({'text': key, 'children': child})
                     else:
                         # leaf node
                         try:
-                            children.append({'text': u'{} = {}'.format(key, val)})
+                            children.append({'text': '{} = {}'.format(key, val)})
                         except UnicodeDecodeError:
                             # key or value is probably binary. For example, CloudTrail API ListPublicKeys
-                            children.append({'text': u'{} = {!r}'.format(key, val)})
+                            children.append({'text': '{} = {!r}'.format(key, val)})
             elif isinstance(obj, (list, tuple)):
                 for i, val in enumerate(obj):
                     child = build_children(val)

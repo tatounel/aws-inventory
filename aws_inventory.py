@@ -2,13 +2,18 @@
 import argparse
 import logging
 import os.path
+import re
+import string
 
 import botocore
 from opinel.utils.console import configPrintException
+from opinel.utils.credentials import get_profiles_from_aws_credentials_file, aws_config_file 
 
 import aws_inventory.config
 import aws_inventory.blacklist
 import aws_inventory.invoker
+
+import tqdm
 
 
 # create a module logger and ignore messages outside of the module. botocore was spewing messages
@@ -27,6 +32,10 @@ def parse_args(args=None):
     parser.add_argument('--profile',
                         default='default',
                         help='Name of the profile (default: %(default)s)')
+
+    parser.add_argument('--regex', default=False,
+                        action='store_true',
+                        help='treat --profile as a regular expression, execute for multiple profiles')
 
     parser.add_argument('--mfa-serial',
                         help='serial number of MFA device')
@@ -62,6 +71,11 @@ def parse_args(args=None):
                         action='store_true',
                         help='Print a list of operations to invoke for a given service and exit')
 
+    parser.add_argument('--output',
+                        default=['gui'],
+                        nargs='+',
+                        help=('List of files to export. Default is "gui". Others include "response" (API JSON) and "exception"'))
+
     parser.add_argument('--dry-run',
                         action='store_true',
                         help=('Go through local API discovery, but do not actually invoke any API. '
@@ -76,14 +90,17 @@ def parse_args(args=None):
                             '(default: %(default)s)'
                         ))
 
-    parser.add_argument('--exceptions-dump', help='File to dump the exceptions store')
+    parser.add_argument('--exception-file-template', 
+                        help='Template filename to dump the exception data (default: {})'.format(aws_inventory.config.EXCEPTION_DATA_FILENAME_TEMPLATE.template),
+                        default=aws_inventory.config.EXCEPTION_DATA_FILENAME_TEMPLATE.template)
 
-    parser.add_argument('--responses-dump', help='File to dump the responses store')
+    parser.add_argument('--response-file-template', 
+                        help='Template filename to dump the responses store (default: {})'.format(aws_inventory.config.RESPONSE_DATA_FILENAME_TEMPLATE.template),
+                        default=aws_inventory.config.RESPONSE_DATA_FILENAME_TEMPLATE.template)
 
-    parser.add_argument('--gui-data-file',
-                        help='File to the GUI data (default: {})'.format(
-                            aws_inventory.config.GUI_DATA_FILENAME_TEMPLATE.template
-                        ))
+    parser.add_argument('--gui-file-template',
+                        help='Template for output GUI data files (default: {})'.format(aws_inventory.config.GUI_DATA_FILENAME_TEMPLATE.template),
+                        default=aws_inventory.config.GUI_DATA_FILENAME_TEMPLATE.template)
 
     parser.add_argument('--debug',
                         action='store_true',
@@ -99,16 +116,20 @@ def parse_args(args=None):
 
     parsed = parser.parse_args(args)
 
+    if type(parsed.gui_file_template) is str:
+        parsed.gui_file_template = string.Template(parsed.gui_file_template)
+    if type(parsed.response_file_template) is str:
+        parsed.response_file_template = string.Template(parsed.response_file_template)
+    if type(parsed.exception_file_template) is str:
+        parsed.exception_file_template = string.Template(parsed.exception_file_template)
+    
     # Fill in filename-based defaults. We can't use "default" kwarg because we need another
     #   commandline arg, namely the profile name.
 
-    if not parsed.gui_data_file:
-        tool_dir = os.path.dirname(__file__)
-        relative_path = aws_inventory.config.GUI_DATA_FILENAME_TEMPLATE.substitute(
-            profile=parsed.profile
-        )
-        parsed.gui_data_file = os.path.join(tool_dir, relative_path)
     return parsed
+
+def data_file_name(template,profile):
+    return template.substitute(profile=profile)
 
 def filter_services(api_model, services=frozenset(), excluded_services=frozenset()):
     """Build a list of services by merging together a white- and black-list.
@@ -243,13 +264,13 @@ def main(args):
     setup_logging(args.debug)
 
     if args.version:
-        print aws_inventory.__version__
+        print(aws_inventory.__version__)
         return
 
     api_model = build_api_model()
 
     if args.list_svcs:
-        print '\n'.join(sorted(filter_services(api_model)))
+        print ('\n'.join(sorted(filter_services(api_model))))
         return
 
     # configure the debug level for opinel
@@ -305,16 +326,29 @@ def main(args):
             len(service_descriptors[svc_name]['regions'])
         )
         if args.list_operations:
-            print '[{}]\n{}\n'.format(
+            print('[{}]\n{}\n'.format(
                 svc_name,
                 '\n'.join(service_descriptors[svc_name]['ops']) or '# NONE'
-            )
+            ))
+
+    profiles = [ args.profile ]
+    if args.regex:
+        # find unique profiles that match the regex
+        profiles = list(set(map(lambda profile : profile.split()[-1], get_profiles_from_aws_credentials_file())))
+        profiles = list(filter(lambda profile : re.search(args.profile,profile), profiles))
+
+    tqdm.tqdm.monitor_interval = 0
 
     if args.list_operations:
-        print 'Total operations to invoke: {}'.format(ops_count)
+        print('Total operations to invoke: {}'.format(ops_count * len(profiles)))
     else:
-        LOGGER.debug('Total operations to invoke: %d.', ops_count)
-        aws_inventory.invoker.ApiInvoker(args, service_descriptors, ops_count).start()
+        LOGGER.debug('Total operations to invoke: %d.', ops_count * len(profiles))
+        for profile in profiles:
+            args.profile=profile
+            gui_data_file       = data_file_name(args.gui_file_template, profile)       if 'gui' in args.output else None
+            response_data_file  = data_file_name(args.response_file_template, profile)  if 'response' in args.output else None
+            exception_data_file = data_file_name(args.exception_file_template, profile) if 'exception' in args.output else None
+            aws_inventory.invoker.ApiInvoker(args, service_descriptors, ops_count, gui_data_file, response_data_file, exception_data_file).probe_services()
 
 if __name__ == '__main__':
     main(parse_args())
